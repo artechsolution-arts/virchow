@@ -1,99 +1,62 @@
 services:
-  # ── Progress Tracking / Fencing ──────────────────────────
-  redis:
-    image: redis:alpine
-    container_name: rag_redis
-    ports:
-      - "6379:6379"
 
-  # ── Message Broker ───────────────────────────────────────
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: rag_rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672" # Management UI
-    healthcheck:
-      test: ["CMD-SHELL", "rabbitmq-diagnostics check_port_connectivity"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # ── SeaweedFS Distributed Storage ────────────────────────
-  seaweedfs-master:
-    image: chrislusf/seaweedfs
-    container_name: seaweedfs_master
-    ports:
-      - "9333:9333"
-    command: "master -ip=seaweedfs-master"
-
-  seaweedfs-volume:
-    image: chrislusf/seaweedfs
-    container_name: seaweedfs_volume
-    depends_on:
-      - seaweedfs-master
-    command: "volume -mserver=seaweedfs-master:9333 -port=8081"
-
-  seaweedfs-filer:
-    image: chrislusf/seaweedfs
-    container_name: seaweedfs_filer
-    depends_on:
-      - seaweedfs-master
-    ports:
-      - "8888:8888"
-    command: "filer -master=seaweedfs-master:9333"
-
-  # ── API Server ───────────────────────────────────────────
-  rag-api:
+  # ── Retrieval API ─────────────────────────────────────────
+  backend:
     build: .
-    container_name: rag_api
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
+    container_name: virchow_backend
     environment:
-      - RABBIT_HOST=rabbitmq
-      - REDIS_HOST=redis
-      - SEAWEEDFS_HOST=seaweedfs-filer
-      - PYTHONPATH=.:..:../../
-    env_file: ../.env
-    volumes:
-      - ./rag-docs:/app/rag_pipeline/rag-docs
-      - ../dots_ocr:/app/dots_ocr
-      - ../backend/weights/DotsOCR:/app/weights/DotsOCR
+      PG_HOST: 192.168.10.10
+      PG_PORT: 5433
+      PG_DATABASE: virchow_dev
+      PG_USER: postgres
+      PG_PASSWORD: 'Eppl$456!'
+      LLM_URL: http://ollama:11434
+      LLM_MODEL: qwen2.5:0.5b
+      JWT_SECRET: change-this-in-production
+      EMBEDDING_DEVICE: cpu
+      MAX_TOKENS: "300"
+      SIM_THRESHOLD: "0.50"
+      TOP_K: "8"
+      SEAWEEDFS_FILER_URL: http://192.168.10.10:8889
+      SEAWEEDFS_BUCKET: rag-docs
     ports:
       - "8080:8080"
-    command: python main.py
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
 
-  # ── Ingestion Worker ─────────────────────────────────────
-  rag-worker:
-    build: .
-    container_name: rag_worker
+  # ── Next.js Frontend ─────────────────────────────────────
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        INTERNAL_URL: http://backend:8080
+    container_name: virchow_web
     depends_on:
-      rabbitmq:
+      backend:
         condition: service_healthy
-      redis:
-        condition: service_started
     environment:
-      - RABBIT_HOST=rabbitmq
-      - REDIS_HOST=redis
-      - SEAWEEDFS_HOST=seaweedfs-filer
-      - PYTHONPATH=.:..:../../
-    env_file: ../.env
-    volumes:
-      - ./rag-docs:/app/rag_pipeline/rag-docs
-      - ../dots_ocr:/app/dots_ocr
-      - ../backend/weights/DotsOCR:/app/weights/DotsOCR
-    command: python worker_main.py
-
-  # ── OCR Engine (DotsOCR VLM) ─────────────────────────────
-  dots_ocr:
-    image: hilab/dots-ocr:latest
-    container_name: rag_dots_ocr
+      NODE_ENV: production
+      INTERNAL_URL: http://backend:8080
     ports:
-      - "8001:8001"
-    environment:
-      - MODEL_NAME=rednote-hilab/dots.ocr
-      - USE_HF=true
-      - DOTS_OCR_WEIGHTS=/app/weights/DotsOCR
+      - "3000:3000"
+    restart: unless-stopped
+
+  # ── Ollama LLM (local inference) ──────────────────────────
+  # Remove this service if you use an external LLM endpoint.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: virchow_ollama
     volumes:
-      - ../backend/weights/DotsOCR:/app/weights/DotsOCR
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

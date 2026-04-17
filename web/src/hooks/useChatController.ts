@@ -685,8 +685,9 @@ export default function useChatController({
             },
             body: JSON.stringify({
               question: currMessage,
+              chat_session_id: frozenSessionId,
             }),
-            signal: AbortSignal.timeout(28000),
+            signal: AbortSignal.timeout(90000),
           });
 
           if (!response.ok) {

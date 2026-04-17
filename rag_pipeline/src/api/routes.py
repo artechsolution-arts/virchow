@@ -1,796 +1,753 @@
-import os, json, uuid, asyncio, logging, time, threading
-from typing import List, Optional
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
-from src.config import MQ_QUEUE_PRIORITY, MQ_QUEUE_NORMAL, MQ_QUEUE_LARGE, MQ_QUEUE_DEAD, UPLOAD_DIR, cfg
-from src.models.schemas import BatchSession, FileProgress, JobPayload
+import logging
+from fastapi import APIRouter, HTTPException, Depends, Form, Cookie, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+from src.auth.jwt_auth import (
+    hash_password, verify_password, create_token, get_current_user, decode_token
+)
 
 logger = logging.getLogger(__name__)
-DEFAULT_ID = "00000000-0000-0000-0000-000000000000"
 
-def create_router(rsm, ids, pipeline, mq_conn):
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    name: str
+    password: str
+    department_id: str = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def create_router(svc):
     router = APIRouter()
-    
-    # ▶ STORAGE ROUTES ────────────────────────────────────────────────────────
-    
-    @router.get("/storage/health")
-    async def storage_health():
-        if not pipeline.storage:
-            return {"seaweedfs": "not configured"}
-        return await pipeline.storage.health()
 
-    @router.get("/storage/jobs/{job_id}/files")
-    async def list_job_files(job_id: str):
-        """List all SeaweedFS objects associated with a job (raw, processed, chunks)."""
-        if not pipeline.storage:
-            raise HTTPException(501, "Object storage not configured")
-        return await pipeline.storage.list_job_files(job_id)
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
-    @router.delete("/storage/jobs/{job_id}/files")
-    async def delete_job_files(job_id: str):
-        """Remove all SeaweedFS artefacts for a completed or failed job."""
-        if not pipeline.storage:
-            raise HTTPException(501, "Object storage not configured")
-        deleted = await pipeline.storage.delete_job_artefacts(job_id)
-        return {"deleted_count": deleted}
+    @router.post("/auth/register")
+    async def register(req: RegisterRequest):
+        dept_id = req.department_id or svc.rbac.get_or_create_default_dept()
+        existing = svc.rbac.get_user_by_email(req.email)
+        if existing:
+            raise HTTPException(409, "Email already registered")
+        user_id = svc.rbac.create_user(
+            email=req.email,
+            name=req.name,
+            password_hash=hash_password(req.password),
+            department_id=dept_id,
+        )
+        token = create_token(user_id, req.email, dept_id)
+        return JSONResponse({"token": token, "user_id": user_id, "dept_id": dept_id, "name": req.name})
 
-    @router.get("/storage/jobs/{job_id}/pdf-url")
-    async def get_pdf_url(job_id: str, filename: str):
-        """Return the direct SeaweedFS filer URL for the raw PDF of a job."""
-        if not pipeline.storage:
-            raise HTTPException(501, "Object storage not configured")
-        return {"url": pipeline.storage.pdf_url(job_id, filename)}
+    @router.post("/auth/login")
+    async def login(req: LoginRequest):
+        user = svc.rbac.get_user_by_email(req.email)
+        if not user or not verify_password(req.password, user["password_hash"]):
+            raise HTTPException(401, "Invalid email or password")
+        if not user["is_active"]:
+            raise HTTPException(403, "Account is disabled")
+        svc.rbac.update_last_login(str(user["id"]))
+        dept_id = str(user["department_id"])
+        token = create_token(str(user["id"]), user["email"], dept_id)
+        return JSONResponse({
+            "token": token,
+            "user_id": str(user["id"]),
+            "dept_id": dept_id,
+            "name": user["name"],
+            "role": user["role"],
+            "is_super_admin": user["is_super_admin"],
+        })
 
+    @router.get("/auth/departments")
+    async def list_departments():
+        return JSONResponse(svc.rbac.list_departments())
 
-    @router.post("/upload/pdfs")
-    async def upload_files(files: List[UploadFile] = File(...), user_id: str = Form(""), dept_id: str = Form(""), upload_type: str = Form("user"), chat_id: str = Form("")):
-        try:
-            sid = str(uuid.uuid4())
-            # Ensure we use a valid UID, falling back to the System account if none provided or invalid
-            uid = user_id if (user_id and user_id != DEFAULT_ID) else ids.get("user_default") or DEFAULT_ID
-            did = dept_id if (dept_id and dept_id != DEFAULT_ID) else ids.get("dept_default") or DEFAULT_ID
-            cid = chat_id or None
-            if not rsm or not rsm.ping(): raise HTTPException(503, "Redis is offline")
-
-            max_bytes = int(cfg.max_pdf_size_mb * 1024 * 1024)
-            session = BatchSession(session_id=sid, total=len(files), user_id=str(uid), dept_id=str(did), upload_type=upload_type)
-            rsm.create_session(session)
-
-            for f in files:
-                contents = await f.read()
-                fid = str(uuid.uuid4())
-
-                # Validate file size
-                if len(contents) > max_bytes:
-                    raise HTTPException(413, f"File '{f.filename}' exceeds {cfg.max_pdf_size_mb}MB limit")
-
-                fpath = UPLOAD_DIR / f"{fid}_{f.filename}"
-                fpath.write_bytes(contents)
-
-                # Register upload record in PostgreSQL BEFORE publishing job (FK integrity)
-                upload_id = None
-                try:
-                    if upload_type == "admin":
-                        upload_id = pipeline.rbac.register_admin_upload(
-                            admin_user_id=str(uid), dept_id=str(did),
-                            file_name=f.filename, file_path=str(fpath),
-                            file_size_bytes=len(contents),
-                        )
-                    else:
-                        upload_id = pipeline.rbac.register_user_upload(
-                            user_id=str(uid), dept_id=str(did),
-                            file_name=f.filename, file_path=str(fpath),
-                            chat_id=cid, file_size_bytes=len(contents),
-                            upload_scope="chat" if cid else "dept",
-                        )
-                except Exception as reg_err:
-                    logger.error(f"Failed to register upload for {f.filename}: {reg_err}")
-
-                fp = FileProgress(file_id=fid, session_id=sid, filename=f.filename, size_kb=len(contents)/1024)
-                rsm.register_file(sid, fp)
-                job = JobPayload(
-                    session_id=sid, file_id=fid, filename=f.filename,
-                    file_path=str(fpath), file_size_kb=len(contents)/1024,
-                    user_id=str(uid), dept_id=str(did),
-                    upload_type=upload_type,
-                    chat_id=str(cid) if cid else None,
-                    upload_id=upload_id,
-                )
-                from src.database.rabbitmq_broker import publish_job
-                publish_job(job)
-            return JSONResponse({"session_id": sid, "files": len(files)})
-        except HTTPException: raise
-        except Exception as e: 
-            logger.error(f"Upload failed: {e}", exc_info=True); raise HTTPException(500, detail=str(e))
-
-    @router.get("/upload/progress/{session_id}")
-    async def upload_progress(session_id: str):
-        try:
-            if not rsm or not rsm.ping(): raise HTTPException(503, "Redis is offline")
-
-            async def _gen():
-                summary = rsm.session_summary(session_id)
-                if summary:
-                    for f in summary.get("files", []):
-                        yield f"data: {json.dumps({'type': 'file_progress', 'data': f})}\n\n"
-
-                # Bridge blocking Redis subscribe into async generator via queue
-                q = asyncio.Queue()
-                loop = asyncio.get_running_loop()
-
-                def _blocking_subscribe():
-                    try:
-                        for event in rsm.subscribe_session(session_id):
-                            loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception as sub_err:
-                        logger.warning(f"Subscribe error: {sub_err}")
-                    finally:
-                        loop.call_soon_threadsafe(q.put_nowait, None)
-
-                thread = threading.Thread(target=_blocking_subscribe, daemon=True)
-                thread.start()
-
-                while True:
-                    event = await q.get()
-                    if event is None:
-                        break
-                    yield f"data: {json.dumps(event)}\n\n"
-
-            return StreamingResponse(_gen(), media_type="text/event-stream")
-        except Exception as e:
-            raise HTTPException(500, detail=str(e))
+    # ── Query ─────────────────────────────────────────────────────────────────
 
     @router.post("/query")
-    async def rag_query(question: str = Form(...), user_id: str = Form(""), dept_id: str = Form(""), chat_id: str = Form(""), search: str = Form("hybrid")):
+    async def rag_query(
+        request: Request,
+        user: dict = Depends(get_current_user),
+    ):
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            question = body.get("question", "")
+            chat_id = body.get("chat_id") or None
+        else:
+            form = await request.form()
+            question = form.get("question", "")
+            chat_id = form.get("chat_id") or None
+            if chat_id == "null":
+                chat_id = None
         try:
-            uid = user_id or ids.get("user_default") or DEFAULT_ID
-            did = dept_id or ids.get("dept_default") or DEFAULT_ID
-            if not chat_id or chat_id == "null" or chat_id == "": chat_id = pipeline.rbac.create_chat(uid, did, title=question[:50])
-            res = pipeline.query(question, str(uid), str(did), chat_id, search)
-            res["chat_id"] = chat_id; return JSONResponse(res)
-        except Exception as e: 
-            logger.error(f"Query Error: {e}", exc_info=True); raise HTTPException(500, detail=str(e))
-
-    @router.get("/admin/chats")
-    async def get_all_chats(user_id: str = DEFAULT_ID, dept_id: str = DEFAULT_ID):
-        conn = pipeline.rbac._get_conn()
-        try:
-            cur = pipeline.rbac._cur(conn)
-            cur.execute("SELECT is_super_admin FROM users WHERE id=%s", (user_id,))
-            user = cur.fetchone(); is_super = user["is_super_admin"] if user else False
-            if is_super:
-                cur.execute("SELECT c.*, u.name as user_name, d.name as dept_name FROM chat c JOIN users u ON u.id=c.user_id JOIN departments d ON d.id=c.department_id ORDER BY c.created_at DESC")
-            else:
-                cur.execute("SELECT c.*, u.name as user_name, d.name as dept_name FROM chat c JOIN users u ON u.id=c.user_id JOIN departments d ON d.id=c.department_id WHERE c.department_id=%s ORDER BY c.created_at DESC", (dept_id,))
-            rows = cur.fetchall()
-            # Convert all UUID/Timestamp to strings for JSON safety
-            chats = []
-            for r in rows:
-                item = dict(r)
-                for k, v in item.items():
-                    if hasattr(v, "hex") or not isinstance(v, (str, int, float, bool, type(None))): item[k] = str(v)
-                chats.append(item)
-            cur.close(); return JSONResponse(chats)
+            result = svc.query(
+                question=question,
+                user_id=user["sub"],
+                dept_id=user["dept_id"],
+                chat_id=chat_id,
+            )
+            return JSONResponse(result)
         except Exception as e:
-            logger.error(f"Failed to fetch chats: {e}", exc_info=True)
-            raise HTTPException(500, detail=str(e))
-        finally:
-            pipeline.rbac._put_conn(conn)
-
-    @router.get("/admin/audit")
-    async def get_audit(dept_id: str = None): return JSONResponse(pipeline.rbac.get_audit_log(dept_id))
-
-    @router.post("/admin/grant")
-    async def grant_access(granting_dept_id: str = Form(...), receiving_dept_id: str = Form(...), user_id: str = Form(...), access_type: str = Form("read")):
-        try:
-            grant_id = pipeline.rbac.grant_dept_access(granting_dept_id, receiving_dept_id, user_id, access_type)
-            return JSONResponse({"status": "success", "grant_id": grant_id})
-        except Exception as e:
-            logger.error(f"Failed to grant access: {e}", exc_info=True)
+            logger.error(f"Query error: {e}", exc_info=True)
             raise HTTPException(500, detail=str(e))
 
-    @router.get("/status")
-    async def pstatus():
-        conn = pipeline.rbac._get_conn()
+    # ── Chat history ──────────────────────────────────────────────────────────
+
+    @router.get("/chats")
+    async def get_chats(user: dict = Depends(get_current_user)):
+        chats = svc.rbac.get_user_chats(user["sub"], user["dept_id"])
+        return JSONResponse(chats)
+
+    @router.post("/chats/create")
+    async def create_chat_session(user: dict = Depends(get_current_user)):
+        chat_id = svc.rbac.create_chat(user["sub"], user["dept_id"], title=None)
+        return JSONResponse({"chat_session_id": chat_id})
+
+    @router.get("/chats/{chat_id}/messages")
+    async def get_messages(chat_id: str, user: dict = Depends(get_current_user)):
+        msgs = svc.rbac.get_messages_full(chat_id, user["dept_id"])
+        return JSONResponse(msgs)
+
+    @router.get("/chats/{chat_id}/meta")
+    async def get_chat_meta(chat_id: str, user: dict = Depends(get_current_user)):
+        meta = svc.rbac.get_chat_meta(chat_id, user["sub"])
+        if not meta:
+            raise HTTPException(404, "Chat not found")
+        return JSONResponse(meta)
+
+    @router.put("/chats/{chat_id}/rename")
+    async def rename_chat(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+        body = await request.json()
+        title = body.get("name", "")
+        svc.rbac.rename_chat(chat_id, user["sub"], title)
+        return JSONResponse({"ok": True})
+
+    @router.delete("/chats/{chat_id}")
+    async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
+        svc.rbac.delete_chat(chat_id, user["sub"])
+        return JSONResponse({"ok": True})
+
+    # ── Document redirect ─────────────────────────────────────────────────────
+
+    @router.get("/api/documents/{doc_id}")
+    async def get_document(doc_id: str):
+        """Redirect to SeaweedFS URL for the document."""
+        import os
+        from fastapi.responses import RedirectResponse
+        from src.config import cfg as _cfg
+
+        conn = svc.rbac._get_conn()
         try:
-            cur = pipeline.rbac._cur(conn)
-            
-            # 1. Fetch Users (Excluding System Master)
-            cur.execute("SELECT u.id, u.name, u.is_super_admin, d.name as dept_name, d.id as dept_id FROM users u JOIN departments d ON d.id=u.department_id WHERE u.email != 'system@internal.rag'")
-            users = []
-            for r in cur.fetchall():
-                item = dict(r)
-                for k, v in item.items():
-                    if not isinstance(v, (str, int, float, bool, type(None))):
-                        item[k] = str(v)
-                users.append(item)
-            
-            # 2. Fetch Departments (For Admin Dropdown)
-            cur.execute("SELECT id, name FROM departments WHERE name != 'System' ORDER BY name ASC")
-            depts = []
-            for r in cur.fetchall():
-                item = dict(r)
-                for k, v in item.items():
-                    if not isinstance(v, (str, int, float, bool, type(None))):
-                        item[k] = str(v)
-                depts.append(item)
-            
+            cur = svc.rbac._cur(conn)
+            cur.execute("SELECT file_name, file_path FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
             cur.close()
-            s = {
-                "redis_online": bool(rsm and rsm.ping()), 
-                "rabbitmq_online": bool(mq_conn and mq_conn.is_open), 
-                "users": users,
-                "departments": depts
-            }
-            return JSONResponse(s)
-        except Exception as e: return JSONResponse({"error": str(e)}, status_code=200)
         finally:
-            pipeline.rbac._put_conn(conn)
+            svc.rbac._put_conn(conn)
 
-    @router.get("/ui", response_class=HTMLResponse)
-    async def upload_ui():
-        html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise RAG Pipeline</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --primary: #3b82f6;
-            --primary-glow: rgba(59, 130, 246, 0.5);
-            --secondary: #6366f1;
-            --bg-dark: #020617;
-            --bg-card: #0f172a;
-            --bg-overlay: rgba(15, 23, 42, 0.7);
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --border: rgba(255, 255, 255, 0.1);
-            --success: #10b981;
-            --error: #ef4444;
-            --warning: #f59e0b;
-        }
+        if not row:
+            raise HTTPException(404, "Document not found")
 
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Outfit', 'Inter', sans-serif;
-            background-color: var(--bg-dark);
-            color: var(--text-main);
-            overflow-x: hidden;
-            background-image: radial-gradient(circle at 50% -20%, #1e293b 0%, #020617 80%);
-            min-height: 100vh;
-        }
+        file_name, file_path = row["file_name"], row["file_path"]
+        basename = os.path.basename(file_path)
+        uuid_part = basename[:36]
+        filename = basename[37:]
+        seaweed_url = f"{_cfg.seaweedfs_filer_url}/buckets/{_cfg.seaweedfs_bucket}/raw/{uuid_part}/{filename}"
 
-        .app-container {
-            display: flex;
-            height: 100vh;
-            max-width: 100vw;
-        }
+        return RedirectResponse(url=seaweed_url, status_code=302)
 
-        /* Sidebar Navigation */
-        nav {
-            width: 260px;
-            background: var(--bg-card);
-            border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-            padding: 1.5rem;
-            flex-shrink: 0;
-            z-index: 100;
-        }
+    # ── Health ────────────────────────────────────────────────────────────────
 
-        .logo {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin-bottom: 2.5rem;
-            background: linear-gradient(to right, #60a5fa, #a78bfa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.02em;
-        }
+    @router.get("/health")
+    async def health():
+        return JSONResponse({"status": "ok"})
 
-        .nav-section { margin-bottom: 2rem; }
-        .nav-label {
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            color: var(--text-muted);
-            letter-spacing: 0.1em;
-            margin-bottom: 1rem;
-            font-weight: 600;
-        }
+    @router.get("/api/health")
+    async def api_health():
+        return JSONResponse({"status": "ok"})
 
-        .nav-item {
-            display: flex;
-            align-items: center;
-            padding: 0.75rem 1rem;
-            margin-bottom: 0.5rem;
-            border-radius: 0.75rem;
-            color: var(--text-muted);
-            text-decoration: none;
-            cursor: pointer;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-            font-weight: 500;
-        }
+    # ── Web-app compat endpoints (called server-side by Next.js) ─────────────
 
-        .nav-item:hover {
-            background: rgba(255, 255, 255, 0.05);
-            color: var(--text-main);
-        }
+    @router.get("/api/auth/type")
+    async def auth_type():
+        return JSONResponse({
+            "auth_type": "basic",
+            "requires_verification": False,
+            "anonymous_user_enabled": False,
+            "password_min_length": 8,
+            "has_users": True,
+            "oauth_enabled": False,
+        })
 
-        .nav-item.active {
-            background: rgba(59, 130, 246, 0.15);
-            color: var(--primary);
-            box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.2);
-        }
+    @router.get("/api/me")
+    async def web_me(request: Request):
+        token = request.cookies.get("fastapiusersauth")
+        if not token:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            payload = decode_token(token)
+        except HTTPException:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = svc.rbac.get_user_by_id(payload["sub"])
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        name = user.get("name", "")
+        return JSONResponse({
+            "id": str(user["id"]),
+            "email": user["email"],
+            "is_active": user["is_active"],
+            "is_superuser": user.get("is_super_admin", False),
+            "is_verified": True,
+            "role": "admin",
+            "is_anonymous_user": False,
+            "team_name": None,
+            "password_configured": True,
+            "preferences": {
+                "auto_scroll": True,
+                "temperature_override_enabled": False,
+                "default_app_mode": "chat",
+            },
+            "personalization": {
+                "name": name,
+                "theme_preference": None,
+                "auto_scroll": True,
+                "default_app_mode": "chat",
+                "pinned_assistants": None,
+            },
+        })
 
-        /* User Profile & Switcher at Bottom */
-        .user-panel {
-            margin-top: auto;
-            border-top: 1px solid var(--border);
-            padding-top: 1.5rem;
-        }
+    @router.get("/api/chat/get-chat-session/{chat_id}")
+    async def get_chat_session_compat(chat_id: str, request: Request):
+        """Compat endpoint: Next.js rewrite forwards /api/chat/get-chat-session/{id} here.
+        Accepts token from Authorization header OR fastapiusersauth cookie."""
+        token = None
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        else:
+            token = request.cookies.get("fastapiusersauth")
+        if not token:
+            raise HTTPException(401, "Not authenticated")
+        try:
+            user = decode_token(token)
+        except HTTPException:
+            raise HTTPException(401, "Invalid token")
+        import re as _re
+        _SINGLE_PREFIX_RE = _re.compile(
+            r'^\*\*[^*]+\.(pdf|xlsx?|docx?|csv|txt)\*\*\n',
+            _re.IGNORECASE,
+        )
+        _MULTI_PREFIX_RE = _re.compile(
+            r'\n\n\*\*[^*]+\.(pdf|xlsx?|docx?|csv|txt)\*\*\n',
+            _re.IGNORECASE,
+        )
+        def _strip_prefix(content: str, role: str) -> str:
+            if role != "assistant":
+                return content
+            # Only strip single-source prefix (multi-source keeps file headers for attribution)
+            if _SINGLE_PREFIX_RE.match(content) and not _MULTI_PREFIX_RE.search(content):
+                return _SINGLE_PREFIX_RE.sub("", content, count=1).strip()
+            return content
 
-        .user-info { margin-bottom: 1rem; }
-        .user-name { font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; }
-        .user-role { font-size: 0.75rem; color: var(--text-muted); }
-        
-        select {
-            background: #1e293b;
-            border: 1px solid var(--border);
-            color: var(--text-main);
-            padding: 0.6rem;
-            border-radius: 0.5rem;
-            width: 100%;
-            font-size: 0.85rem;
-            outline: none;
-        }
-
-        /* Main Content View */
-        main {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            position: relative;
-        }
-
-        header {
-            padding: 1.5rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid var(--border);
-            backdrop-filter: blur(12px);
-            background: var(--bg-overlay);
-            z-index: 50;
-        }
-
-        .header-title { font-size: 1.25rem; font-weight: 600; }
-
-        .view-pane {
-            flex: 1;
-            padding: 2rem;
-            overflow-y: auto;
-            display: none;
-        }
-
-        .view-pane.active { display: block; }
-
-        /* Dashboard/Stats Grid */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .stat-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            padding: 1.5rem;
-            border-radius: 1rem;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        }
-
-        .stat-val { font-size: 1.75rem; font-weight: 700; margin: 0.5rem 0; color: var(--primary); }
-        .stat-lbl { font-size: 0.85rem; color: var(--text-muted); }
-
-        /* Upload Section */
-        .upload-zone {
-            border: 2px dashed var(--border);
-            border-radius: 1.5rem;
-            padding: 4rem 2rem;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            background: rgba(255, 255, 255, 0.02);
-            margin-bottom: 2rem;
-        }
-
-        .upload-zone:hover {
-            border-color: var(--primary);
-            background: rgba(59, 130, 246, 0.05);
-        }
-
-        .upload-title { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }
-        .upload-hint { color: var(--text-muted); font-size: 0.9rem; }
-
-        .file-list { margin-top: 2rem; }
-        .progress-tile {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: 1rem;
-            padding: 1rem 1.5rem;
-            margin-bottom: 1rem;
-            animation: slideIn 0.3s ease-out;
-        }
-
-        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-        .tile-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
-        .tile-name { font-weight: 500; font-size: 0.95rem; }
-        .tile-stage { font-size: 0.7rem; text-transform: uppercase; font-weight: 700; border-radius: 4px; padding: 2px 8px; background: rgba(59, 130, 246, 0.1); color: var(--primary); }
-
-        .progress-bar-bg { height: 6px; background: rgba(255, 255, 255, 0.1); border-radius: 3px; overflow: hidden; }
-        .progress-bar-fill { height: 100%; background: var(--primary); transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); width: 0%; box-shadow: 0 0 10px var(--primary-glow); }
-
-        /* Chat View */
-        .chat-layout { height: 100%; display: flex; flex-direction: column; overflow: hidden; max-width: 900px; margin: 0 auto; }
-        #chat-scroll { flex: 1; overflow-y: auto; padding-right: 10px; margin-bottom: 1.5rem; }
-        .bubble { max-width: 80%; padding: 1rem 1.25rem; border-radius: 1.25rem; margin-bottom: 1rem; line-height: 1.6; font-size: 0.95rem; }
-        .bubble-bot { align-self: flex-start; background: #1e293b; border-bottom-left-radius: 4px; }
-        .bubble-user { align-self: flex-end; background: var(--primary); color: white; border-bottom-right-radius: 4px; margin-left: auto; }
-
-        .chat-input-area { position: relative; }
-        textarea {
-            width: 100%; resize: none; background: #1e293b; border: 1px solid var(--border); border-radius: 1rem;
-            padding: 1rem 3.5rem 1rem 1.25rem; color: white; font-family: inherit; font-size: 1rem; outline: none;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
-        }
-
-        .send-btn {
-            position: absolute; right: 0.75rem; bottom: 0.75rem; width: 2.5rem; height: 2.5rem; border-radius: 0.75rem;
-            background: var(--primary); border: none; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center;
-        }
-
-        /* Buttons */
-        .btn-primary {
-            background: var(--primary); color: white; border: none; padding: 0.8rem 1.5rem; border-radius: 0.75rem;
-            font-weight: 600; cursor: pointer; transition: all 0.2s;
-        }
-        .btn-primary:hover { transform: translateY(-1px); filter: brightness(1.1); }
-
-        /* Typing Dots */
-        .typing { display: flex; gap: 4px; padding: 1rem; background: #1e293b; border-radius: 1.25rem; width: fit-content; margin-bottom: 1rem; }
-        .dot { width: 6px; height: 6px; background: var(--text-muted); border-radius: 50%; animation: bounce 1.4s infinite ease-in-out both; }
-        .dot:nth-child(1) { animation-delay: -0.32s; } .dot:nth-child(2) { animation-delay: -0.16s; }
-        @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
-    </style>
-</head>
-<body>
-    <div class="app-container">
-        <nav>
-            <div class="logo">RAG.Engine</div>
-            
-            <div class="nav-section">
-                <div class="nav-label">General</div>
-                <div class="nav-item active" onclick="switchPane('pane-chat', this)">
-                    <span>Chat Assistant</span>
-                </div>
-                <div class="nav-item" onclick="switchPane('pane-upload', this)">
-                    <span>Data Ingestion</span>
-                </div>
-            </div>
-
-            <div class="nav-section" id="nav-admin" style="display:none">
-                <div class="nav-label">Administration</div>
-                <div class="nav-item" onclick="switchPane('pane-audit', this)">
-                    <span>Audit Logs</span>
-                </div>
-                <div class="nav-item" onclick="switchPane('pane-access', this)">
-                    <span>Policy Access</span>
-                </div>
-            </div>
-
-            <div class="user-panel">
-                <div class="user-info">
-                    <span class="user-name" id="label-user">Loading...</span>
-                    <span class="user-role" id="label-role">Account Placeholder</span>
-                </div>
-                <select id="user-switcher"></select>
-            </div>
-        </nav>
-
-        <main>
-            <header>
-                <div class="header-title" id="pane-title">Chat Assistant</div>
-                <div id="status-indicators" style="display:flex; gap: 1rem;">
-                    <div id="status-redis" style="font-size:0.7rem; color: var(--success);">● Redis Online</div>
-                    <div id="status-mq" style="font-size:0.7rem; color: var(--success);">● MQ Connected</div>
-                </div>
-            </header>
-
-            <!-- Chat Pane -->
-            <div id="pane-chat" class="view-pane active">
-                <div class="chat-layout">
-                    <div id="chat-scroll">
-                        <div class="bubble bubble-bot">Welcome. I'm your enterprise knowledge agent. Upload documents to get started or ask me questions about your processed records.</div>
-                    </div>
-                    <div id="typing-box" style="display:none">
-                        <div class="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
-                    </div>
-                    <div class="chat-input-area">
-                        <textarea id="chat-input" rows="1" placeholder="Type your message..."></textarea>
-                        <button class="send-btn" id="send-btn">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-                        </button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Upload Pane -->
-            <div id="pane-upload" class="view-pane">
-                <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-lbl">Active Workers</div><div class="stat-val" id="stat-workers">0</div></div>
-                    <div class="stat-card"><div class="stat-lbl">Successful Ingests</div><div class="stat-val" id="stat-ok">0</div></div>
-                    <div class="stat-card"><div class="stat-lbl">Failed Jobs</div><div class="stat-val" id="stat-fail">0</div></div>
-                </div>
-
-                <!-- ONLY VISIBLE TO SUPER ADMIN -->
-                <div id="admin-dept-scope" class="stat-card" style="margin-bottom: 2rem; display: none;">
-                    <h3 style="margin-bottom: 1rem;">Department Scope (Admin Override)</h3>
-                    <select id="target-dept"></select>
-                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">As an administrator, you can route these documents to any department's index.</p>
-                </div>
-
-                <input type="file" id="file-input" multiple hidden accept="application/pdf">
-                <div class="upload-zone" onclick="document.getElementById('file-input').click()">
-                    <div class="upload-title">Drop files or click to browse</div>
-                    <div class="upload-hint">Upload high-resolution PDFs for optimized OCR + Embedding</div>
-                </div>
-
-                <div class="file-list" id="progress-list"></div>
-            </div>
-
-            <!-- Audit Pane -->
-            <div id="pane-audit" class="view-pane">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 2rem;">
-                    <h3>System Audit Logs</h3>
-                    <button class="btn-primary" onclick="loadAudit()" style="padding: 0.4rem 1rem; font-size: 0.8rem;">Refresh</button>
-                </div>
-                <div id="audit-table-container"></div>
-            </div>
-
-            <!-- Access Pane -->
-            <div id="pane-access" class="view-pane">
-                <h3>Department Security Policy</h3>
-                <div class="stat-card" style="margin-top: 1.5rem; max-width: 600px;">
-                    <p style="margin-bottom: 1.5rem; color: var(--text-muted);">Grant cross-department access to allow users from one department to query knowledge owned by another.</p>
-                    <div style="margin-bottom:1rem">
-                        <label style="font-size:0.75rem; display:block; margin-bottom:5px">DATA OWNER (Granting Dept)</label>
-                        <select id="grant-from"></select>
-                    </div>
-                    <div style="margin-bottom:1.5rem">
-                        <label style="font-size:0.75rem; display:block; margin-bottom:5px">RECEIVING PARTY (Target Dept)</label>
-                        <select id="grant-to"></select>
-                    </div>
-                    <button class="btn-primary" id="grant-btn">Apply Policy Change</button>
-                </div>
-            </div>
-
-        </main>
-    </div>
-
-    <script>
-        const $ = id => document.getElementById(id);
-        let currentUser = null;
-        let allUsers = [];
-        let allDepts = [];
-        let isTyping = false;
-        let currentChatId = null;
-
-        // Pane Switcher
-        function switchPane(paneId, navItem) {
-            document.querySelectorAll('.view-pane').forEach(p => p.classList.remove('active'));
-            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-            $(paneId).classList.add('active');
-            if (navItem) navItem.classList.add('active');
-            
-            const titles = {
-                'pane-chat': 'Chat Assistant',
-                'pane-upload': 'Data Ingestion',
-                'pane-audit': 'System Audit Logs',
-                'pane-access': 'Policy Management'
-            };
-            $('pane-title').innerText = titles[paneId] || 'Dashboard';
-            
-            if(paneId === 'pane-audit') loadAudit();
-        }
-
-        async function loadStatus() {
-            try {
-                const r = await fetch('/status');
-                const d = await r.json();
-                allUsers = d.users || [];
-                allDepts = d.departments || [];
-                
-                $('status-redis').style.color = d.redis_online ? 'var(--success)' : 'var(--error)';
-                $('status-mq').style.color = d.rabbitmq_online ? 'var(--success)' : 'var(--error)';
-                
-                const sel = $('user-switcher');
-                sel.innerHTML = allUsers.map((u, i) => `<option value="${i}">${u.name}</option>`).join('');
-                
-                const deptSelectors = [$('target-dept'), $('grant-from'), $('grant-to')];
-                deptSelectors.forEach(s => {
-                    if(s) s.innerHTML = allDepts.map(dt => `<option value="${dt.id}">${dt.name}</option>`).join('');
-                });
-
-                sel.onchange = () => applyUser(allUsers[sel.value]);
-                if(allUsers.length) applyUser(allUsers[0]);
-            } catch(e) { console.error(e); }
-        }
-
-        function applyUser(user) {
-            currentUser = user;
-            $('label-user').innerText = user.name;
-            $('label-role').innerText = user.is_super_admin ? 'Super Administrator' : (user.dept_name || 'Dept Member');
-            $('nav-admin').style.display = user.is_super_admin ? 'block' : 'none';
-            
-            // Toggle Admin Override visibility - ONLY for Super Admin
-            if(user.is_super_admin) {
-                $('admin-dept-scope').style.display = 'block';
-            } else {
-                $('admin-dept-scope').style.display = 'none';
+        msgs = svc.rbac.get_messages_full(chat_id, user["dept_id"])
+        meta = svc.rbac.get_chat_meta(chat_id, user["sub"]) or {}
+        messages = [
+            {
+                "message_id": idx + 1,
+                "message_type": "user" if m["role"] == "user" else "assistant",
+                "research_type": None,
+                "parent_message": idx if idx > 0 else None,
+                "latest_child_message": idx + 2 if idx < len(msgs) - 1 else None,
+                "message": _strip_prefix(m["content"], m["role"]),
+                "rephrased_query": None,
+                "context_docs": None,
+                "time_sent": m.get("created_at"),
+                "overridden_model": "",
+                "alternate_assistant_id": None,
+                "chat_session_id": chat_id,
+                "citations": None,
+                "files": [],
+                "tool_call": None,
+                "current_feedback": None,
+                "sub_questions": [],
+                "comments": None,
+                "parentMessageId": None,
+                "refined_answer_improvement": None,
+                "is_agentic": None,
             }
+            for idx, m in enumerate(msgs)
+        ]
+        return JSONResponse({
+            "chat_session_id": chat_id,
+            "description": meta.get("title") or "New Chat",
+            "persona_id": 0,
+            "persona_name": "Virchow Assistant",
+            "messages": messages,
+            "time_created": meta.get("created_at"),
+            "time_updated": meta.get("updated_at"),
+            "shared_status": "private",
+            "current_temperature_override": None,
+            "current_alternate_model": "",
+            "owner_name": None,
+            "packets": [],
+        })
 
-            // Clear view
-            $('chat-scroll').innerHTML = '<div class="bubble bubble-bot">Context cleared. Session switched to ' + user.name + '.</div>';
-            currentChatId = null;
-        }
+    @router.get("/api/settings")
+    async def web_settings():
+        return JSONResponse({
+            "anonymous_user_enabled": False,
+            "invite_only_enabled": False,
+            "notifications": [],
+            "needs_reindexing": False,
+            "gpu_enabled": False,
+            "application_status": "active",
+            "auto_scroll": True,
+            "temperature_override_enabled": False,
+            "query_history_type": "disabled",
+        })
 
-        // --- UPLOAD LOGIC ---
-        $('file-input').onchange = async (e) => {
-            const files = e.target.files;
-            if(!files.length) return;
-            
-            // Determine target dept id based on role
-            const targetDeptId = currentUser.is_super_admin ? $('target-dept').value : currentUser.dept_id;
+    @router.get("/api/enterprise-settings")
+    async def web_enterprise_settings():
+        return JSONResponse({
+            "whitelabeling": None,
+            "custom_header_content": None,
+            "custom_header_logo": None,
+            "two_factor_auth_enabled": False,
+            "anonymous_user_enabled": False,
+            "enable_paid_enterprise_edition_features": False,
+        })
 
-            const fd = new FormData();
-            for(const f of files) fd.append('files', f);
-            fd.append('user_id', currentUser.id);
-            fd.append('dept_id', targetDeptId); 
-            fd.append('upload_type', currentUser.is_super_admin ? 'admin' : 'user');
+    # ── Frontend (single-page chat app) ───────────────────────────────────────
 
-            try {
-                const r = await fetch('/upload/pdfs', { method:'POST', body:fd });
-                const d = await r.json();
-                startProgress(d.session_id);
-            } catch(e) { alert('Upload error'); }
-        };
-
-        function startProgress(sid) {
-            const ev = new EventSource('/upload/progress/' + sid);
-            ev.onmessage = e => {
-                const msg = JSON.parse(e.data);
-                if(msg.type === 'file_progress') {
-                    updateTile(msg.data);
-                } else if(msg.type === 'session_complete') {
-                    ev.close();
-                    refreshStats();
-                }
-            };
-        }
-
-        function updateTile(f) {
-            let tile = $(f.file_id);
-            if(!tile) {
-                tile = document.createElement('div');
-                tile.id = f.file_id;
-                tile.className = 'progress-tile';
-                $('progress-list').prepend(tile);
-            }
-            tile.innerHTML = `
-                <div class="tile-header">
-                    <span class="tile-name">${f.filename}</span>
-                    <span class="tile-stage">${f.stage}</span>
-                </div>
-                <div class="progress-bar-bg">
-                    <div class="progress-bar-fill" style="width: ${f.pct}%"></div>
-                </div>
-            `;
-        }
-
-        async function refreshStats() {
-            try {
-                const d = await (await fetch('/status')).json();
-                $('stat-ok').innerText = d.redis_online ? 'Online' : 'Checking...';
-            } catch(e) { console.error(e); }
-        }
-
-        // --- CHAT LOGIC ---
-        $('send-btn').onclick = async () => {
-            const msg = $('chat-input').value.trim();
-            if(!msg || isTyping) return;
-            
-            addBubble('user', msg);
-            $('chat-input').value = '';
-            $('typing-box').style.display = 'block';
-            isTyping = true; scrollChat();
-
-            const fd = new FormData();
-            fd.append('question', msg);
-            fd.append('user_id', currentUser.id);
-            fd.append('dept_id', currentUser.dept_id);
-            if(currentChatId) fd.append('chat_id', currentChatId);
-
-            try {
-                const r = await fetch('/query', { method: 'POST', body: fd });
-                const d = await r.json();
-                if(d.chat_id) currentChatId = d.chat_id;
-                addBubble('bot', d.answer, d.citations);
-            } catch(e) {
-                addBubble('bot', 'Execution error encountered.');
-            } finally {
-                $('typing-box').style.display = 'none';
-                isTyping = false; scrollChat();
-            }
-        };
-
-        function addBubble(role, text, sources=[]) {
-            const b = document.createElement('div');
-            b.className = 'bubble bubble-' + role;
-            b.innerText = text;
-            if(sources && sources.length > 0) {
-                const s = document.createElement('div');
-                s.style.cssText = 'font-size:0.7rem; margin-top:0.5rem; color: #60a5fa; border-top: 1px solid rgba(255,255,255,0.05); padding-top:0.5rem;';
-                s.innerText = 'Sources: ' + sources.join(', ');
-                b.appendChild(s);
-            }
-            $('chat-scroll').appendChild(b);
-        }
-
-        function scrollChat() { $('chat-scroll').scrollTop = $('chat-scroll').scrollHeight; }
-
-        async function loadAudit() {
-            const r = await fetch('/admin/audit');
-            const logs = await r.json();
-            $('audit-table-container').innerHTML = `
-                <table style="width:100%; border-collapse:collapse; font-size:0.85rem;">
-                    <thead style="background:rgba(255,255,255,0.05); text-align:left;">
-                        <tr><th style="padding:1rem;">Time</th><th style="padding:1rem;">Action</th><th style="padding:1rem;">Target</th></tr>
-                    </thead>
-                    <tbody>
-                        ${logs.map(l => `
-                            <tr style="border-bottom: 1px solid var(--border);">
-                                <td style="padding:1rem; color:var(--text-muted);">${l.created_at.split('.')[0]}</td>
-                                <td style="padding:1rem; font-weight:600;">${l.action_type}</td>
-                                <td style="padding:1rem; color:var(--primary);">${l.target_type || '-'} (${l.target_id || 'n/a'})</td>
-                            </tr>
-                        `).join('')}
-                    </tbody>
-                </table>
-            `;
-        }
-
-        $('grant-btn').onclick = async () => {
-            const fd = new FormData();
-            fd.append('granting_dept_id', $('grant-from').value);
-            fd.append('receiving_dept_id', $('grant-to').value);
-            fd.append('user_id', currentUser.id);
-            fd.append('access_type', 'read');
-            
-            const r = await fetch('/admin/grant', { method: 'POST', body: fd });
-            if(r.ok) alert('Cross-dept access policy updated.');
-            else alert('Policy update failed.');
-        }
-
-        loadStatus();
-    </script>
-</body>
-</html>
-"""
-        return HTMLResponse(content=html)
+    @router.get("/", response_class=HTMLResponse)
+    async def frontend():
+        return HTMLResponse(content=_HTML)
 
     return router
+
+
+_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Virchow — Knowledge Assistant</title>
+<style>
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --border: rgba(255,255,255,0.08);
+    --primary: #3b82f6; --primary-dim: rgba(59,130,246,0.15);
+    --text: #f1f5f9; --muted: #64748b; --success: #10b981; --error: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui,sans-serif; background: var(--bg); color: var(--text);
+         height: 100vh; overflow: hidden; }
+  #app { display: flex; height: 100vh; }
+
+  /* ── Auth overlay ── */
+  #auth-overlay {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; z-index: 999;
+  }
+  .auth-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 1rem; padding: 2.5rem; width: 380px;
+  }
+  .auth-card h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.25rem; }
+  .auth-card p  { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.75rem; }
+  .field { margin-bottom: 1rem; }
+  .field label { display: block; font-size: 0.75rem; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .field input, .field select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 0.5rem; padding: 0.65rem 0.85rem; color: var(--text);
+    font-size: 0.95rem; outline: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--primary); }
+  .btn {
+    width: 100%; padding: 0.75rem; border: none; border-radius: 0.5rem;
+    background: var(--primary); color: #fff; font-size: 1rem; font-weight: 600;
+    cursor: pointer; transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.9; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .tab-row { display: flex; gap: 0.5rem; margin-bottom: 1.75rem; }
+  .tab {
+    flex: 1; padding: 0.5rem; border: 1px solid var(--border); border-radius: 0.5rem;
+    background: none; color: var(--muted); cursor: pointer; font-size: 0.9rem;
+  }
+  .tab.active { background: var(--primary-dim); color: var(--primary); border-color: var(--primary); }
+  .auth-msg { margin-top: 1rem; font-size: 0.85rem; text-align: center; min-height: 1.2em; }
+
+  /* ── Sidebar ── */
+  aside {
+    width: 240px; background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; flex-shrink: 0;
+  }
+  .sidebar-header {
+    padding: 1.25rem 1rem; border-bottom: 1px solid var(--border);
+    font-weight: 700; font-size: 1.1rem;
+    background: linear-gradient(to right, #60a5fa, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .new-chat-btn {
+    margin: 0.75rem; padding: 0.6rem; border: 1px dashed var(--border);
+    border-radius: 0.5rem; background: none; color: var(--muted); cursor: pointer;
+    font-size: 0.85rem; text-align: left;
+  }
+  .new-chat-btn:hover { border-color: var(--primary); color: var(--primary); }
+  #chat-list { flex: 1; overflow-y: auto; padding: 0 0.5rem; }
+  .chat-item {
+    padding: 0.6rem 0.75rem; border-radius: 0.5rem; cursor: pointer;
+    font-size: 0.85rem; color: var(--muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; margin-bottom: 0.25rem;
+  }
+  .chat-item:hover, .chat-item.active { background: var(--primary-dim); color: var(--text); }
+  .sidebar-footer {
+    padding: 1rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--muted);
+  }
+  .logout-btn {
+    margin-top: 0.5rem; background: none; border: 1px solid var(--border);
+    border-radius: 0.4rem; color: var(--muted); padding: 0.35rem 0.75rem;
+    cursor: pointer; font-size: 0.8rem;
+  }
+  .logout-btn:hover { color: var(--error); border-color: var(--error); }
+
+  /* ── Main chat area ── */
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #messages {
+    flex: 1; overflow-y: auto; padding: 1.5rem;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .bubble {
+    max-width: 720px; padding: 0.9rem 1.1rem; border-radius: 1rem;
+    line-height: 1.65; font-size: 0.95rem; white-space: pre-wrap;
+  }
+  .bubble.user { align-self: flex-end; background: var(--primary); color: #fff;
+                  border-bottom-right-radius: 4px; }
+  .bubble.bot  { align-self: flex-start; background: var(--surface);
+                  border-bottom-left-radius: 4px; }
+  .bubble .sources {
+    margin-top: 0.6rem; padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.1);
+    font-size: 0.75rem; color: #93c5fd;
+  }
+  .typing-dots { display: flex; gap: 5px; padding: 0.9rem 1.1rem;
+                  background: var(--surface); border-radius: 1rem; width: fit-content; }
+  .dot { width: 7px; height: 7px; background: var(--muted); border-radius: 50%;
+          animation: bounce 1.3s infinite ease-in-out; }
+  .dot:nth-child(2) { animation-delay: 0.15s; }
+  .dot:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce { 0%,80%,100% { transform: scale(0.6); } 40% { transform: scale(1); } }
+
+  #input-area {
+    padding: 1rem 1.5rem; border-top: 1px solid var(--border);
+    display: flex; gap: 0.75rem; align-items: flex-end;
+  }
+  #msg-input {
+    flex: 1; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0.75rem; padding: 0.75rem 1rem; color: var(--text);
+    font-size: 0.95rem; font-family: inherit; resize: none; outline: none;
+    max-height: 160px;
+  }
+  #msg-input:focus { border-color: var(--primary); }
+  #send-btn {
+    width: 42px; height: 42px; border-radius: 0.65rem; border: none;
+    background: var(--primary); color: #fff; cursor: pointer; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #send-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; color: var(--muted);
+    gap: 0.5rem;
+  }
+  .empty-state h2 { font-size: 1.4rem; color: var(--text); }
+</style>
+</head>
+<body>
+
+<!-- Auth overlay -->
+<div id="auth-overlay">
+  <div class="auth-card">
+    <h1>Virchow</h1>
+    <p>Knowledge Assistant — sign in to continue</p>
+
+    <div class="tab-row">
+      <button class="tab active" onclick="showTab('login')">Sign In</button>
+      <button class="tab" onclick="showTab('register')">Register</button>
+    </div>
+
+    <!-- Login form -->
+    <div id="login-form">
+      <div class="field"><label>Email</label><input id="l-email" type="email" placeholder="you@example.com"></div>
+      <div class="field"><label>Password</label><input id="l-pass" type="password" placeholder="••••••••"></div>
+      <button class="btn" onclick="doLogin()">Sign In</button>
+    </div>
+
+    <!-- Register form -->
+    <div id="register-form" style="display:none">
+      <div class="field"><label>Full name</label><input id="r-name" type="text" placeholder="Jane Doe"></div>
+      <div class="field"><label>Email</label><input id="r-email" type="email" placeholder="you@example.com"></div>
+      <div class="field"><label>Password</label><input id="r-pass" type="password" placeholder="••••••••"></div>
+      <div class="field"><label>Department</label>
+        <select id="r-dept"><option value="">Loading…</option></select>
+      </div>
+      <button class="btn" onclick="doRegister()">Create Account</button>
+    </div>
+
+    <p class="auth-msg" id="auth-msg"></p>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app" style="display:none">
+  <aside>
+    <div class="sidebar-header">Virchow</div>
+    <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
+    <div id="chat-list"></div>
+    <div class="sidebar-footer">
+      <div id="user-label"></div>
+      <button class="logout-btn" onclick="logout()">Sign out</button>
+    </div>
+  </aside>
+
+  <main>
+    <div id="messages">
+      <div class="empty-state">
+        <h2>How can I help you?</h2>
+        <p>Ask anything about your knowledge base.</p>
+      </div>
+    </div>
+
+    <div id="input-area">
+      <textarea id="msg-input" rows="1" placeholder="Ask a question…"></textarea>
+      <button id="send-btn" onclick="sendMessage()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+  </main>
+</div>
+
+<script>
+  let token = localStorage.getItem('vk_token');
+  let session = JSON.parse(localStorage.getItem('vk_session') || 'null');
+  let currentChatId = null;
+  let busy = false;
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  window.onload = async () => {
+    await loadDepts();
+    if (token && session) enterApp();
+    document.getElementById('msg-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+  };
+
+  async function loadDepts() {
+    try {
+      const r = await fetch('/auth/departments');
+      const depts = await r.json();
+      const sel = document.getElementById('r-dept');
+      if (depts.length === 0) {
+        sel.innerHTML = '<option value="">Default (auto-created)</option>';
+      } else {
+        sel.innerHTML = depts.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+      }
+    } catch(e) { /* ignore */ }
+  }
+
+  // ── Auth tabs ─────────────────────────────────────────────────────────────
+  function showTab(t) {
+    document.querySelectorAll('.tab').forEach((b,i) => b.classList.toggle('active', (i===0) === (t==='login')));
+    document.getElementById('login-form').style.display    = t === 'login'    ? '' : 'none';
+    document.getElementById('register-form').style.display = t === 'register' ? '' : 'none';
+    document.getElementById('auth-msg').textContent = '';
+  }
+
+  function setAuthMsg(txt, ok) {
+    const el = document.getElementById('auth-msg');
+    el.textContent = txt;
+    el.style.color = ok ? 'var(--success)' : 'var(--error)';
+  }
+
+  async function doLogin() {
+    const email = document.getElementById('l-email').value.trim();
+    const pass  = document.getElementById('l-pass').value;
+    if (!email || !pass) return setAuthMsg('Fill in all fields', false);
+    try {
+      const r = await fetch('/auth/login', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email, password: pass})
+      });
+      const d = await r.json();
+      if (!r.ok) return setAuthMsg(d.detail || 'Login failed', false);
+      saveSession(d);
+    } catch(e) { setAuthMsg('Network error', false); }
+  }
+
+  async function doRegister() {
+    const name  = document.getElementById('r-name').value.trim();
+    const email = document.getElementById('r-email').value.trim();
+    const pass  = document.getElementById('r-pass').value;
+    const dept  = document.getElementById('r-dept').value;
+    if (!name || !email || !pass) return setAuthMsg('Fill in all fields', false);
+    try {
+      const r = await fetch('/auth/register', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, email, password: pass, department_id: dept || null})
+      });
+      const d = await r.json();
+      if (!r.ok) return setAuthMsg(d.detail || 'Registration failed', false);
+      saveSession(d);
+    } catch(e) { setAuthMsg('Network error', false); }
+  }
+
+  function saveSession(d) {
+    token = d.token;
+    session = {user_id: d.user_id, dept_id: d.dept_id, name: d.name};
+    localStorage.setItem('vk_token', token);
+    localStorage.setItem('vk_session', JSON.stringify(session));
+    enterApp();
+  }
+
+  function enterApp() {
+    document.getElementById('auth-overlay').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    document.getElementById('user-label').textContent = session.name;
+    loadChats();
+  }
+
+  function logout() {
+    localStorage.removeItem('vk_token');
+    localStorage.removeItem('vk_session');
+    location.reload();
+  }
+
+  // ── Chats ─────────────────────────────────────────────────────────────────
+  async function loadChats() {
+    try {
+      const r = await authFetch('/chats');
+      const chats = await r.json();
+      const list = document.getElementById('chat-list');
+      list.innerHTML = chats.map(c =>
+        `<div class="chat-item" onclick="openChat('${c.id}')">${c.title || 'Untitled'}</div>`
+      ).join('');
+    } catch(e) { /* ignore */ }
+  }
+
+  function newChat() {
+    currentChatId = null;
+    document.getElementById('messages').innerHTML = `
+      <div class="empty-state">
+        <h2>How can I help you?</h2>
+        <p>Ask anything about your knowledge base.</p>
+      </div>`;
+    document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
+  }
+
+  async function openChat(id) {
+    currentChatId = id;
+    document.querySelectorAll('.chat-item').forEach(el => {
+      el.classList.toggle('active', el.getAttribute('onclick').includes(id));
+    });
+    try {
+      const r = await authFetch(`/chats/${id}/messages`);
+      const msgs = await r.json();
+      const box = document.getElementById('messages');
+      box.innerHTML = '';
+      msgs.forEach(m => appendBubble(m.role === 'user' ? 'user' : 'bot', m.content));
+      scrollBottom();
+    } catch(e) { /* ignore */ }
+  }
+
+  // ── Messaging ─────────────────────────────────────────────────────────────
+  async function sendMessage() {
+    const input = document.getElementById('msg-input');
+    const text  = input.value.trim();
+    if (!text || busy) return;
+
+    // Clear empty state if present
+    const box = document.getElementById('messages');
+    if (box.querySelector('.empty-state')) box.innerHTML = '';
+
+    appendBubble('user', text);
+    input.value = '';
+    input.style.height = '';
+
+    const dots = document.createElement('div');
+    dots.className = 'typing-dots';
+    dots.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
+    box.appendChild(dots);
+    scrollBottom();
+
+    busy = true;
+    document.getElementById('send-btn').disabled = true;
+
+    try {
+      const fd = new FormData();
+      fd.append('question', text);
+      if (currentChatId) fd.append('chat_id', currentChatId);
+
+      const r = await authFetch('/query', {method: 'POST', body: fd});
+      const d = await r.json();
+      dots.remove();
+
+      if (!r.ok) throw new Error(d.detail || 'Query failed');
+
+      currentChatId = d.chat_id;
+      appendBubble('bot', d.answer, d.citations || []);
+      loadChats();
+    } catch(e) {
+      dots.remove();
+      appendBubble('bot', 'Error: ' + e.message);
+    } finally {
+      busy = false;
+      document.getElementById('send-btn').disabled = false;
+      scrollBottom();
+    }
+  }
+
+  function appendBubble(role, text, sources) {
+    const b = document.createElement('div');
+    b.className = `bubble ${role}`;
+    b.textContent = text;
+    if (sources && sources.length) {
+      const s = document.createElement('div');
+      s.className = 'sources';
+      s.textContent = 'Sources: ' + sources.join(', ');
+      b.appendChild(s);
+    }
+    document.getElementById('messages').appendChild(b);
+  }
+
+  function scrollBottom() {
+    const box = document.getElementById('messages');
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function authFetch(url, opts = {}) {
+    return fetch(url, {
+      ...opts,
+      headers: {...(opts.headers || {}), 'Authorization': 'Bearer ' + token}
+    });
+  }
+
+  // Auto-resize textarea
+  document.addEventListener('DOMContentLoaded', () => {
+    const ta = document.getElementById('msg-input');
+    if (ta) ta.addEventListener('input', () => {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    });
+  });
+</script>
+</body>
+</html>"""

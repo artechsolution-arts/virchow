@@ -12,7 +12,6 @@ import Spacer from "@/refresh-components/Spacer";
 import DynamicBottomSpacer from "@/components/chat/DynamicBottomSpacer";
 import {
   useCurrentMessageHistory,
-  useCurrentMessageTree,
   useLoadingError,
   useUncaughtError,
 } from "@/app/app/stores/useChatSessionStore";
@@ -65,7 +64,6 @@ const ChatUI = React.memo(
   }: ChatUIProps) => {
     // Get messages and error state from store
     const messages = useCurrentMessageHistory();
-    const messageTree = useCurrentMessageTree();
     const error = useUncaughtError();
     const loadError = useLoadingError();
     // Stable fallbacks to avoid changing prop identities on each render
@@ -118,9 +116,6 @@ const ChatUI = React.memo(
         <div className="flex flex-col w-full max-w-[var(--app-page-main-content-width)] h-full pt-4 pb-8 pr-1 gap-12">
           {messages.map((message, i) => {
             const messageReactComponentKey = `message-${message.nodeId}`;
-            const parentMessage = message.parentNodeId
-              ? messageTree?.get(message.parentNodeId)
-              : null;
             if (message.type === "user") {
               const nextMessage =
                 messages.length > i + 1 ? messages[i + 1] : null;
@@ -140,9 +135,7 @@ const ChatUI = React.memo(
                     messageId={message.messageId}
                     nodeId={message.nodeId}
                     onEdit={handleEditWithMessageId}
-                    otherMessagesCanSwitchTo={
-                      parentMessage?.childrenNodeIds ?? emptyChildrenIds
-                    }
+                    otherMessagesCanSwitchTo={emptyChildrenIds}
                     onMessageSelection={onMessageSelection}
                   />
                 </div>
@@ -187,9 +180,7 @@ const ChatUI = React.memo(
                     messageId={message.messageId}
                     currentFeedback={message.currentFeedback}
                     llmManager={llmManager}
-                    otherMessagesCanSwitchTo={
-                      parentMessage?.childrenNodeIds ?? emptyChildrenIds
-                    }
+                    otherMessagesCanSwitchTo={emptyChildrenIds}
                     onMessageSelection={onMessageSelection}
                     onRegenerate={createRegenerator}
                     parentMessage={previousMessage}
