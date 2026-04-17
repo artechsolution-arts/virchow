@@ -1,0 +1,10 @@
+[project]
+name = "virchow-backend"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "virchow[backend,dev,ee]",
+]
+
+[tool.uv.sources]
+virchow = { workspace = true }

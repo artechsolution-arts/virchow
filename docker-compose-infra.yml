@@ -1,0 +1,41 @@
+services:
+  relational_db:
+    image: postgres:15-alpine
+    container_name: rag-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: Eppl$456!
+      POSTGRES_DB: virchow_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rag-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: rag-seaweedfs
+    restart: always
+    ports:
+      - "9333:9333"
+      - "8888:8888"
+      - "8080:8080"
+    command: "server -s3 -filer"
